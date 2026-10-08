@@ -4,7 +4,8 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import * as path from 'path';
 import * as aios from './aios';
-import { parseRequest, buildSpawnCmd, buildResumeCmd, needsTaskFile, type BusRequest } from '../core/commandBus';
+import { parseRequest, sanitizeName, buildSpawnCmd, buildResumeCmd, needsTaskFile, type BusRequest } from '../core/commandBus';
+import { parseSlashCommand, countExtraSlashRuns } from '../core/slashVerify';
 import { ResumeIndex } from './resumeIndex';
 import { buildInboxReadme, shouldWrite } from '../core/inboxReadme';
 import {
@@ -302,7 +303,11 @@ function emit(win: BrowserWindow | undefined, kind: string, payload: Record<stri
 
 /** Live session by sanitized name, from the authoritative registry. */
 function targetByName(name: string): SendTarget | undefined {
-  const hit = aios.listRunningAgents().find((a) => a.name === name);
+  /* A request's name is already sanitized to a lowercase kebab handle, but a session can carry
+     any casing in the registry ('Market-desk' after a /rename). Compare like with like, or that
+     session is unreachable by send and kill while looking perfectly alive. Exact match wins. */
+  const hit = aios.listRunningAgents().find((a) => a.name === name)
+    ?? aios.listRunningAgents().find((a) => sanitizeName(a.name) === sanitizeName(name));
   if (!hit || !Number.isInteger(hit.pid) || hit.pid <= 1) return undefined;
   return {
     name: hit.name, pid: hit.pid,
@@ -567,6 +572,13 @@ async function runSend(
      that already arrived. A baseline that moves cannot detect the thing it is a baseline for.
      This is the other half of the 2026-08-12 four-deliveries bug, and the half that made it
      unrecoverable: even after the text had landed, no later poll could ever prove it. */
+  /* A slash command lands as a command record, never as a user turn carrying the typed text, so
+     the needle count alone reports every delivered `/remote-control <name>` as undelivered. Add
+     the command records the needle cannot see (core/slashVerify). Zero, and no transcript read,
+     for an ordinary prompt. */
+  const isSlash = !!parseSlashCommand(deliverText);
+  const slashRuns = (sid: string): number =>
+    isSlash ? countExtraSlashRuns(readTranscript(sid), deliverText, needle, claimedAt) : 0;
   let baseline: number | undefined;
   for (;;) {
     const target = targetByName(req.name);
@@ -579,7 +591,7 @@ async function runSend(
     }
     // idle → deliver, then prove it in the target's own transcript
     const sessionId = target ? target.sessionId : '';
-    if (baseline === undefined) baseline = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt);
+    if (baseline === undefined) baseline = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt) + slashRuns(sessionId);
     const before = baseline;
     /* THE CAP HAS TO SIT HERE, before the send — not only in the after-a-miss decision.
        A 'wait' verdict does `continue`, which re-enters this branch, so a cap enforced only
@@ -587,7 +599,7 @@ async function runSend(
        every cycle for the full hold. Caught by tracing the control flow rather than trusting
        the counter, which is the same lesson as everything else in this ticket. */
     if (attempts >= maxAttemptsFor(deliverText)) {
-      const late = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt);
+      const late = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt) + slashRuns(sessionId);
       if (verifyVerdict(before, late) !== 'pending') {
         try { fs.unlinkSync(heldPath); } catch { /* already gone */ }
         log(`delivered → '${req.name}' (verified late)`);
@@ -622,7 +634,7 @@ async function runSend(
     const until = Date.now() + VERIFY_WINDOW_MS;
     while (Date.now() < until) {
       await new Promise((r) => setTimeout(r, VERIFY_TICK_MS));
-      const now = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt);
+      const now = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt) + slashRuns(sessionId);
       const verdict = verifyVerdict(before, now);
       if (verdict === 'pending') continue;
       try { fs.unlinkSync(heldPath); } catch { /* already gone */ }
@@ -657,7 +669,7 @@ async function runSend(
     if (miss.do === 'wait') {
       /* Out of sends, not out of hope: watch for a late arrival and never type again. A turn
          that lands after the window closed must not be sent twice. */
-      const late = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt);
+      const late = countUserTurnsContaining(readTranscript(sessionId), needle, claimedAt) + slashRuns(sessionId);
       if (verifyVerdict(before, late) !== 'pending') {
         try { fs.unlinkSync(heldPath); } catch { /* already gone */ }
         log(`delivered → '${req.name}' (verified late)`);
